@@ -1,0 +1,135 @@
+name: Sync upstream releases
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/sync-upstream-releases.yml']
+permissions:
+  contents: write
+concurrency:
+  group: sync-upstream-releases
+  cancel-in-progress: false
+jobs:
+  sync:
+    if: github.repository == 'jiandanyangyang/VoiceStudio'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Mirror and verify upstream release assets
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          from urllib.parse import quote
+
+          SOURCE = 'debpalash/VoiceStudio'
+          DEST = os.environ['GITHUB_REPOSITORY']
+          MARKER = '<!-- upstream-release-mirror: debpalash/VoiceStudio -->'
+
+          def gh(*args):
+              return subprocess.check_output(['gh', *args], text=True)
+
+          def api(path, payload=None):
+              args = ['gh', 'api', path]
+              if payload is not None:
+                  args += ['--method', 'POST', '--input', '-']
+              result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
+                                      text=True, capture_output=True)
+              if result.returncode:
+                  if 'HTTP 404' in result.stderr:
+                      return None
+                  raise RuntimeError(result.stderr)
+              return json.loads(result.stdout) if result.stdout.strip() else None
+
+          def assets(repo, release_id):
+              pages = json.loads(gh('api', '--paginate', '--slurp',
+                                   f'repos/{repo}/releases/{release_id}/assets?per_page=100'))
+              return [a for page in pages for a in page]
+
+          def main():
+              if DEST != 'jiandanyangyang/VoiceStudio':
+                  raise RuntimeError('Unexpected destination repository')
+              upstream = api(f'repos/{SOURCE}/releases/latest')
+              if upstream is None:
+                  print('No published stable upstream release.')
+                  return
+              tag = upstream['tag_name']
+              mirror_tag = 'mirror-' + tag
+              source_assets = assets(SOURCE, upstream['id'])
+              if not source_assets:
+                  print('Upstream has no assets yet; retry next run.')
+                  return
+              target = api(f'repos/{DEST}/releases/tags/{quote(mirror_tag, safe="")}')
+              if target and MARKER not in (target.get('body') or ''):
+                  raise RuntimeError('Existing release is not managed by this workflow')
+              body = (MARKER + '\nMirrored, unmodified release assets from [' + SOURCE + '](' +
+                      upstream['html_url'] + ').\n\nOriginal source: https://github.com/' +
+                      SOURCE + '/tree/' + quote(tag, safe='') +
+                      '\n\nThe mirror tag points to this fork workflow commit. '
+                      'GitHub automatic Source code archives here are NOT the upstream release source; '
+                      'use the original source link above. Updater manifests retain upstream URLs.\n\n---\n\n' +
+                      (upstream.get('body') or ''))
+              if not target:
+                  target = api(f'repos/{DEST}/releases', {
+                      'tag_name': mirror_tag, 'target_commitish': os.environ['GITHUB_SHA'],
+                      'name': upstream.get('name') or tag, 'body': body,
+                      'draft': True, 'prerelease': False})
+              if not target:
+                  raise RuntimeError('Could not create mirror release')
+              current = {a['name']: a for a in assets(DEST, target['id'])}
+              uploaded = 0
+              with tempfile.TemporaryDirectory() as folder:
+                  for index, asset in enumerate(source_assets):
+                      name = asset['name']
+                      if not name or name in ('.', '..') or '/' in name or chr(92) in name:
+                          raise RuntimeError('Unsafe upstream asset name')
+                      old = current.get(name)
+                      digest = asset.get('digest')
+                      if (old and old['size'] == asset['size'] and digest
+                              and old.get('digest') == digest and old.get('state') == 'uploaded'):
+                          continue
+                      asset_dir = Path(folder) / str(index)
+                      asset_dir.mkdir()
+                      path = asset_dir / name
+                      subprocess.run(['curl', '--fail', '--location', '--retry', '5',
+                                      '--retry-all-errors', '--output', str(path),
+                                      asset['browser_download_url']], check=True)
+                      if path.stat().st_size != asset['size']:
+                          raise RuntimeError('Asset size mismatch: ' + name)
+                      if digest:
+                          algorithm, expected = digest.split(':', 1)
+                          with path.open('rb') as stream:
+                              actual = hashlib.file_digest(stream, algorithm).hexdigest()
+                          if actual != expected:
+                              raise RuntimeError('Asset digest mismatch: ' + name)
+                      gh('release', 'upload', mirror_tag, str(path), '--repo', DEST, '--clobber')
+                      path.unlink()
+                      uploaded += 1
+              final = {a['name']: a for a in assets(DEST, target['id'])}
+              for a in source_assets:
+                  found = final.get(a['name'])
+                  if (not found or found['size'] != a['size'] or found.get('state') != 'uploaded'
+                          or (a.get('digest') and found.get('digest') != a['digest'])):
+                      raise RuntimeError('Uploaded asset verification failed: ' + a['name'])
+              if target['draft'] or target.get('body') != body or target.get('name') != (upstream.get('name') or tag):
+                  notes = Path(os.environ['RUNNER_TEMP']) / 'mirror-release-notes.md'
+                  notes.write_text(body, encoding='utf-8')
+                  gh('release', 'edit', mirror_tag, '--repo', DEST, '--draft=false',
+                     '--title', upstream.get('name') or tag, '--notes-file', str(notes))
+              summary = f'Mirrored {tag}: {len(source_assets)} assets verified, {uploaded} uploaded.\n'
+              print(summary)
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
+                  stream.write(summary + f'\nhttps://github.com/{DEST}/releases/tag/{quote(mirror_tag, safe="")}\n')
+
+          if __name__ == '__main__':
+              main()
+          PY
