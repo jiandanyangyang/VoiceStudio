@@ -58,6 +58,20 @@ does not update clients already on `v0.2.1`.
 
 ## 5. Cutting a release
 
+Release notes lead with the biggest user-visible change, not README edits or
+packaging internals. For a desktop redesign or migration, include a real UI
+screenshot pinned to the release tag, explain what changed, and give direct
+installer links and migration steps. Keep Highlights to 3–5 bullets, followed
+by concise themed entries. Preserve any installer-trust disclosures.
+
+Verify credits against the previous-tag-to-new-tag commit comparison and the
+included PRs, including contributor branches merged through maintainer branches.
+Add a Contributors section naming every human author and their contribution;
+thank verified bug reporters separately and identify dependency bots separately.
+Do not infer contributors from the existing changelog's `thanks` entries alone.
+Electron publishes the authored version section verbatim, with any required
+installer-trust disclosure appended by the workflow.
+
 1. **CHANGELOG first (hard rule):** make sure `CHANGELOG.md` has a complete,
    user-facing `## [X.Y.Z] — DATE` section (rename `## [Unreleased]`).
    `release.yml` extracts that section verbatim as the GitHub Release body —
@@ -71,26 +85,18 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-The `Desktop Release` workflow fires on tag push. It builds four targets in parallel on GitHub Actions runners:
+`electron-release.yml` builds Linux x64, Windows x64, macOS arm64 and macOS
+x64 installers with updater metadata and packaged startup checks. Ordinary tag
+pushes create drafts; a tag-scoped manual dispatch with `publish=true` publishes
+after all four targets pass. Signing checks apply by default.
 
-| Target | Runner | Artifact |
-|---|---|---|
-| macOS Apple Silicon | macos-14 | `.dmg` + updater `.app.tar.gz` |
-| macOS Intel | macos-13 | `.dmg` + updater `.app.tar.gz` |
-| Windows x64 | windows-2022 | `.msi`, machine-wide and per-user, each with its updater `.sig` |
-| Linux x64 | ubuntu-22.04 | `.AppImage` + updater `.AppImage.sig` |
-
-Each runner signs the updater payload with the stored `TAURI_SIGNING_PRIVATE_KEY`, merges into a single `latest.json`, and attaches everything to the draft release.
-
-Workflow runtime: **~20-40 minutes** (PyInstaller + four platform builds). Follow progress at:
-`https://github.com/debpalash/VoiceStudio/actions`
-
-The release stays a draft while the platforms build. Once every platform, the
-updater-manifest repair and the uninstall scripts are done, the
-`release-notes-checksums` job writes all four platforms' checksums into the
-notes and publishes it, with no manual step. A failed platform leaves the
-release a draft, so nothing half-built goes public. Existing clients detect
-the update on their next launch.
+For the one-time transition tag, set `TAURI_SUNSET_TAG`, dispatch `release.yml`
+on that tag with `draft=true`, and wait for its final Tauri installers and signed
+updater feeds. Then dispatch `electron-release.yml` on the same tag. Automatic
+Electron builds are skipped for this tag to avoid racing the Tauri draft.
+Keep the release draft until both builds and their checks have passed.
+See [Electron transition](#electron-desktop-releases) below for
+signing requirements and the explicit owner-only unsigned exception.
 
 ## 5b. Deployment channels — all must ship (hard rule, owner-set 2026-07-16)
 
@@ -100,8 +106,9 @@ bug to fix immediately, not backlog.
 
 | Channel | Source | Produced by | How to verify |
 |---|---|---|---|
-| GitHub Release: installers + signed `latest.json` (**Stable** updater channel) | the `vX.Y.Z` tag | `release.yml` on tag push | Release page has dmg (arm+intel), msi (machine-wide and per-user), AppImage, `latest.json` and `latest-user.json`; body = the CHANGELOG section (not the auto-generated fallback), followed by per-platform checksums and a **Contributors** avatar strip (owner + every PR author for the tag — the `contributors-strip` job) |
-| **Preview** updater channel (rolling `preview` prerelease) | **`main` only** | `release.yml` nightly cron / manual dispatch | preview `latest.json` uses main's version when it is ahead; otherwise it advances the stable patch, then appends `-N` so it semver-sorts above stable |
+| GitHub Release: Electron installers and updater manifests | the `vX.Y.Z` tag | `electron-release.yml`, explicit publish dispatch | All four platforms, Electron manifests, SHA256SUMS.txt, versioned CHANGELOG notes; retained Tauri feeds point to the final Tauri tag |
+| Final Tauri installers and signed updater feeds | `TAURI_SUNSET_TAG` | `release.yml`, manual dispatch only | Both macOS architectures, Windows system/user installers, Linux AppImage, signed `latest.json` and `latest-user.json` |
+| Desktop preview channel | frozen during transition | no scheduled publishing | Existing preview assets remain available; new desktop previews are paused |
 | GHCR CUDA image: `:X.Y.Z`, `:X.Y`, `:stable` | the tag | `docker.yml` on tag push | `docker manifest inspect ghcr.io/debpalash/omnivoice-studio:X.Y.Z` |
 | GHCR ROCm image: `:X.Y.Z-rocm`, `:X.Y-rocm`, `:stable-rocm` | the tag | `docker.yml` on tag push | same, with `-rocm` suffix |
 | Docker Hub mirror of **all** the above tags | the tag | `docker.yml` (gated on `DOCKERHUB_*` secrets) | tag list at hub.docker.com/r/palashdeb/omnivoice-studio/tags |
@@ -109,11 +116,15 @@ bug to fix immediately, not backlog.
 | Rolling Docker previews: `:latest`, `:main`, `:rocm` | **`main` only** | `docker.yml` on every main push | tag timestamps move with main |
 
 **Preview/RC policy:** there are no RC tags (beta cadence — see CLAUDE.md).
-The preview channel *is* the release candidate, and it **always builds from
-`main`** — the preview-gate in `release.yml` refuses `publish_preview` from
-any other branch, and the rolling Docker tags track `main` by construction.
-To get users testing a fix: merge to `main`, then cut a preview. Never a
-side-branch build.
+Rolling Docker previews always build from `main`. Desktop preview publication
+is paused during the Electron transition; never publish a side-branch preview.
+
+Linux Electron packages carry the native helper's non-glibc shared libraries in
+`resources/native/lib`. The helper resolves these privately, without changing the
+backend's library path. Packaging checks reject missing or host-resolved libraries;
+a relocation test removes the build-time libraries before launching the fixture.
+Validate the downloaded CI AppImage on a clean target too: build dependencies on
+the CI runner can otherwise conceal missing runtime libraries.
 
 ## 6. Expect-to-fail-first-time on Windows and Linux
 
@@ -161,3 +172,52 @@ before Tauri uploads them again. A macOS retry also replaces that architecture's
 versionless updater archive. Other versions, sibling platforms, and updater
 manifests remain intact. Inventory or deletion permission/network failures stop
 the job instead of hiding an upload collision.
+
+## Electron desktop releases
+
+Electron is the primary desktop distribution. electron-release.yml builds Linux
+x64, Windows x64, macOS arm64 and macOS x64, checks packaged startup and updater
+artifacts, then creates a draft. Publishing requires a tag-scoped manual dispatch
+with publish=true. Tag pushes never publish automatically. electron-build.yml
+remains the artifact-only rehearsal; run it before tagging.
+
+Set TAURI_SUNSET_TAG to the final Tauri version tag. Run the manual release.yml
+on that tag first; it rejects other refs. Automatic Tauri builds and scheduled
+previews are retired. Keep the transition release draft until Electron on the
+same tag completes. Electron requires the final signed latest.json and
+latest-user.json assets; subsequent releases copy those feeds without changing
+their immutable sunset payload URLs. Retain the sunset release and its assets.
+
+Write versioned CHANGELOG notes before release. The Electron release body uses
+that authored section verbatim, including its introduction and contributor
+credits; describe Tauri migration only when relevant, without announcing another
+Tauri release. Review all four platform builds,
+checksums, signing requirements and docs/electron-migration.md. Existing Electron
+artifact names and app IDs remain stable for updater compatibility. This pipeline
+ships stable releases; rolling preview publication is paused during transition.
+
+Preparation is not proof of cross-platform packaging, signing, migration, or a
+real installed update hop. Record those results before release. Keep Tauri source
+and shared assets until remaining Electron resource references are relocated.
+No tag, version bump, or publishing is authorized by workflow preparation alone.
+
+Electron signing uses ELECTRON_CSC_LINK and ELECTRON_CSC_KEY_PASSWORD secrets.
+Without them rehearsal/draft artifacts are unsigned or ad-hoc signed. Publishing
+checks macOS signing/notarization and Windows Authenticode signatures by default.
+The owner may explicitly choose the existing unsigned-release policy by dispatching
+with `allow_unsigned=true` (both dispatch and rerun actors must be the repository owner); the release notes then disclose OS trust warnings and
+unverified macOS automatic updates. Never select this exception without the owner's
+choice. Tauri's signing keys do not sign Electron packages.
+
+For the transition tag, automatic Electron release jobs are skipped. Build the
+manual Tauri sunset draft first, then dispatch Electron on the same tag after
+its signed updater feeds exist. Later tags build Electron automatically.
+
+
+If a packaging-workflow fix is needed after tagging, keep the release tag
+immutable. Merge and validate the workflow fix on main, then dispatch
+`electron-release.yml` from main with `release_tag=vX.Y.Z`. Validation and every
+packaging/release job check out that exact tag; only the workflow comes from
+main. Empty signing secrets are omitted from the builder environment so drafts
+and explicitly accepted unsigned builds do not interpret the working directory
+as a certificate. Publication still requires `publish=true` and the same guards.

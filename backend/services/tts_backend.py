@@ -195,8 +195,8 @@ def _float_env(name: str, default: float) -> float:
 
 
 class TTSInputError(ValueError):
-    """The caller-supplied text can't be synthesized by the selected engine
-    (empty / nothing speakable after cleanup). Subclasses ValueError so the
+    """The caller input cannot be synthesized by the selected engine
+    (empty text, nothing speakable after cleanup, or missing reference audio). Subclasses ValueError so the
     native /generate route's existing ValueError→400 mapping applies;
     /v1/audio/speech maps it to 400 explicitly (#1173 class — these used to
     surface as opaque 500s like "need at least one array to concatenate")."""
@@ -542,6 +542,26 @@ def _prompt_disk_load(key: tuple):
         return None
 
 
+def _prompt_cache_evict(key: tuple) -> None:
+    """Discard one prompt from both cache layers. Never raises.
+
+    Transcript-free prompts use a different identity from fully conditioned
+    prompts. Once ASR resolves the transcript, the former must not remain as a
+    viable stale fallback for the same reference clip.
+    """
+    with _prompt_cache_lock:
+        _prompt_cache.pop(key, None)
+    cache_dir = _prompt_disk_dir()
+    if cache_dir is None:
+        return
+    try:
+        os.remove(_prompt_disk_path(cache_dir, key))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.debug("could not evict stale voice prompt: %s", exc)
+
+
 def _prompt_disk_save(key: tuple, prompt) -> None:
     """Persist ``prompt`` under ``key`` and prune old entries. Never raises."""
     cache_dir = _prompt_disk_dir()
@@ -605,6 +625,29 @@ def _get_clone_prompt(
     Every short segment falling back to its speaker ref then re-encodes it
     (~0.4 s each, measured). Scan-resistance, not a second cache policy.
     """
+    # Resolve transcript-free references through an already-installed ASR
+    # before deriving the cache key. This protects every native OmniVoice
+    # caller (generate, streaming, batch, dub, audiobook and OpenAI-compatible
+    # speech), including routes that do not have a profile row on which to
+    # persist the transcript. Incomplete reference conditioning can destabilize
+    # the reference/target boundary and introduce words in the generated prefix.
+    unresolved_key = None
+    if ref_audio and not ref_text:
+        try:
+            unresolved_key = _clone_prompt_key(
+                ref_audio, None, preprocess_prompt
+            )
+        except Exception:
+            pass
+        try:
+            from services.asr_backend import transcribe_reference
+
+            ref_text = transcribe_reference(ref_audio)
+        except Exception as e:  # noqa: BLE001 — model fallback remains available
+            logger.warning("reference transcript resolution failed: %s", e)
+        if ref_text and unresolved_key is not None:
+            _prompt_cache_evict(unresolved_key)
+
     try:
         key = _clone_prompt_key(ref_audio, ref_text, preprocess_prompt)
     except Exception:
@@ -754,6 +797,27 @@ class OmniVoiceBackend(TTSBackend):
         # The live OmniVoice instance. Reuses the singleton owned by
         # model_manager so memory isn't doubled.
         self._model = model
+
+    @property
+    def execution_device(self) -> str | None:
+        """Actual device of the shared model, for live engine diagnostics."""
+        if self._model is None:
+            return None
+        try:
+            return str(next(self._model.parameters()).device)
+        except Exception:  # noqa: BLE001 - third-party model wrappers vary
+            device = getattr(self._model, "device", None)
+            return str(device) if device is not None else None
+
+    @property
+    def dtype(self) -> str | None:
+        """Actual parameter precision of the shared model when resident."""
+        if self._model is None:
+            return None
+        try:
+            return str(next(self._model.parameters()).dtype)
+        except Exception:  # noqa: BLE001 - diagnostics must remain best effort
+            return None
 
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
@@ -1560,6 +1624,7 @@ class KittenTTSBackend(TTSBackend):
 # resolved unchanged by `resolve_kokoro_lang_code()` below.
 _KOKORO_ISO_BY_FULL_NAME = {
     "english": "en",
+    "british english": "en-gb",
     "spanish": "es",
     "french": "fr",
     "hindi": "hi",
@@ -1568,6 +1633,31 @@ _KOKORO_ISO_BY_FULL_NAME = {
     "japanese": "ja",
     "chinese": "zh",
 }
+
+
+def _kokoro_supported_labels(aliases: dict, lang_codes: dict) -> list[str]:
+    """Human labels for every language Kokoro accepts, read from its own tables.
+
+    Derived from the installed package, never from
+    ``_KOKORO_ISO_BY_FULL_NAME``: that map exists to translate full names
+    *into* Kokoro's codes, and reusing it to describe what Kokoro supports
+    understates the model when a newly supported code has no full-name alias.
+    Read every installed code so new languages remain visible without changing
+    the input-name map.
+    """
+    labels: dict[str, str] = {}
+    # Prefer the full name a caller can actually pass.
+    for name, iso in _KOKORO_ISO_BY_FULL_NAME.items():
+        code = aliases.get(iso, iso)
+        if code in lang_codes:
+            labels.setdefault(code, name.title())
+    # Then whatever the installed table supports that no full name reaches. Its
+    # own description is a display name for some codes ("British English") and
+    # an ISO tag for others ("pt-br"); either names the language better than
+    # dropping it.
+    for code, described in lang_codes.items():
+        labels.setdefault(code, str(described))
+    return sorted(labels.values())
 
 
 def resolve_kokoro_lang_code(language: str) -> str:
@@ -1587,7 +1677,12 @@ def resolve_kokoro_lang_code(language: str) -> str:
     iso = _KOKORO_ISO_BY_FULL_NAME.get(key, key)
     code = ALIASES.get(iso, iso)
     if code not in LANG_CODES:
-        supported = ", ".join(sorted(name.title() for name in _KOKORO_ISO_BY_FULL_NAME))
+        # Labels from newer installed tables must remain selectable even when
+        # they have no entry in our compatibility map of full names.
+        code = next((candidate for candidate, label in LANG_CODES.items()
+                     if str(label).strip().lower() == key), code)
+    if code not in LANG_CODES:
+        supported = ", ".join(_kokoro_supported_labels(ALIASES, LANG_CODES))
         raise ValueError(
             f"mlx-audio's Kokoro model (mlx-community/Kokoro-82M-bf16) doesn't "
             f"support language={language!r}. Kokoro supports: {supported}. "
@@ -1776,22 +1871,40 @@ class MLXAudioBackend(TTSBackend):
                 # model is actually active.
                 kwargs["lang_code"] = language[:2].lower()
 
-        pieces = []
+        def collect(results):
+            groups = []
+            rate = None
+            pending = []
+
+            def flush():
+                if not pending:
+                    return
+                audio = np.concatenate(pending, axis=-1)
+                if rate != self.sample_rate:
+                    import torchaudio
+                    audio = torchaudio.functional.resample(
+                        torch.from_numpy(audio), rate, self.sample_rate,
+                    ).numpy()
+                groups.append(audio)
+                pending.clear()
+
+            for result in results:
+                audio = getattr(result, "audio", result)
+                if hasattr(audio, "numpy"):
+                    audio = audio.numpy()
+                sr = getattr(result, "sample_rate", self.sample_rate)
+                if sr != rate:
+                    flush()
+                    rate = sr
+                pending.append(np.asarray(audio, dtype=np.float32))
+            flush()
+            return groups
+
         try:
-            for result in self._model.generate(**kwargs):
-                audio = getattr(result, "audio", result)
-                if hasattr(audio, "numpy"):
-                    audio = audio.numpy()
-                pieces.append(np.asarray(audio, dtype=np.float32))
+            pieces = collect(self._model.generate(**kwargs))
         except TypeError:
-            # Some engines don't accept lang_code / ref_audio. Retry with
-            # only the universal kwargs.
-            pieces = []
-            for result in self._model.generate(text=text, speed=speed):
-                audio = getattr(result, "audio", result)
-                if hasattr(audio, "numpy"):
-                    audio = audio.numpy()
-                pieces.append(np.asarray(audio, dtype=np.float32))
+            # Retry engines that accept only the universal arguments.
+            pieces = collect(self._model.generate(text=text, speed=speed))
 
         if not pieces:
             raise RuntimeError(f"mlx-audio ({self._model_id}) produced no audio")
@@ -2010,13 +2123,36 @@ class GPTSoVITSBackend(TTSBackend):
     @classmethod
     def is_available(cls) -> tuple[bool, str]:
         # GPT-SoVITS runs as an external API server — check if it's reachable.
-        from services.outbound_http import open_trusted_endpoint
+        # api_v2 exposes POST /tts; api.py (v1) did not. Probing /tts with GET
+        # lets the server's own FastAPI stack answer — a healthy api_v2
+        # responds with 200/400/405 (the route exists, just for a different
+        # verb or with different inputs), while api.py answers 404 because
+        # the path is unmapped. The two are now distinguishable instead of
+        # both reading as "server not reachable".
+        from services.outbound_http import EndpointHTTPError, open_trusted_endpoint
         url = os.environ.get("OMNIVOICE_GPTSOVITS_URL", "http://127.0.0.1:9880")
         try:
-            with open_trusted_endpoint(url, method="GET", timeout=2):
+            with open_trusted_endpoint(
+                url, method="GET", path="tts", timeout=2, allowed_statuses={400, 405},
+                # api_v2 lowercases these before validating missing inputs.
+                query="text=&text_lang=en&prompt_lang=en",
+            ):
                 pass
-            return True, "ready (server reachable)"
+            return True, "ready (api_v2 server reachable)"
+        except EndpointHTTPError as exc:
+            if exc.status == 404:
+                return False, (
+                    f"GPT-SoVITS server at {url} is reachable but does not "
+                    "expose api_v2's /tts route. Start it with: "
+                    "python api_v2.py -a 127.0.0.1 -p 9880 -c "
+                    "GPT_SoVITS/configs/tts_infer.yaml"
+                )
+            return False, (
+                f"GPT-SoVITS server at {url} returned HTTP {exc.status}. "
+                "Check the server logs and access configuration."
+            )
         except Exception:
+            # Connection refused / DNS failure / unsafe endpoint / etc.
             return False, (
                 f"GPT-SoVITS server not reachable at {url}. "
                 "Start it with: python api_v2.py -a 127.0.0.1 -p 9880 "
@@ -2032,7 +2168,7 @@ class GPTSoVITSBackend(TTSBackend):
         return ["zh", "en", "ja", "yue", "ko"]
 
     def generate(self, text: str, **kw) -> torch.Tensor:
-        import urllib.parse
+        import json
         from services.outbound_http import open_trusted_endpoint
 
         ref_audio = kw.get("ref_audio")
@@ -2046,24 +2182,54 @@ class GPTSoVITSBackend(TTSBackend):
         }
         text_lang = lang_map.get(language.lower() if language else "en", "en")
 
-        # Build request params
-        params = {
+        # api_v2 takes a JSON body to /tts (api.py v1 took a query string
+        # at the root URL with different field names). The two protocols do
+        # not share a schema, so sending v1-shaped params to an api_v2
+        # server produces a 404 and a silent failure.
+        body: dict[str, object] = {
             "text": text,
-            "text_language": text_lang,
+            "text_lang": text_lang,
+            "text_split_method": "cut0",
+            "media_type": "wav",
+            "streaming_mode": False,
         }
-        if ref_audio:
-            params["refer_wav_path"] = ref_audio
-            params["prompt_text"] = ref_text or ""
-            params["prompt_language"] = text_lang
+        # api_v2 has no server-side default reference (api.py's -dr/-dt/-dl
+        # flags are v1 only) and answers 400 without one, so a plain TTS
+        # request — no voice profile — needs the clip from the environment.
+        # Profiles store the desired output language, not the reference's
+        # spoken language. Let api_v2 detect the reference transcript language
+        # independently, including mixed-language clips, instead of forcing
+        # it through the target language's phonemizer.
+        prompt_lang = "auto"
+        if not ref_audio:
+            ref_audio = os.environ.get("OMNIVOICE_GPTSOVITS_REF_AUDIO") or None
+            ref_text = os.environ.get("OMNIVOICE_GPTSOVITS_REF_TEXT", "") if ref_audio else ""
+            prompt_lang = lang_map.get(
+                os.environ.get("OMNIVOICE_GPTSOVITS_REF_LANG", "").lower(), "auto"
+            )
+        if not ref_audio:
+            raise TTSInputError(
+                "GPT-SoVITS (api_v2) needs a reference clip for every request: "
+                "pick a voice profile, or set OMNIVOICE_GPTSOVITS_REF_AUDIO (path "
+                "readable by the server) and OMNIVOICE_GPTSOVITS_REF_TEXT (its "
+                "transcript) as the default voice."
+            )
+        body["ref_audio_path"] = ref_audio
+        body["prompt_text"] = ref_text or ""
+        body["prompt_lang"] = prompt_lang
 
         speed = kw.get("speed", 1.0)
         if speed != 1.0:
-            params["speed_factor"] = str(speed)
+            body["speed_factor"] = float(speed)
 
-        query = urllib.parse.urlencode(params)
         try:
             with open_trusted_endpoint(
-                self._url, method="POST", query=query, timeout=120
+                self._url,
+                method="POST",
+                path="tts",
+                body=json.dumps(body).encode("utf-8"),
+                content_type="application/json",
+                timeout=120,
             ) as resp:
                 audio_bytes = resp.read()
         except Exception as e:
@@ -2371,7 +2537,7 @@ _INSTALL_HINTS: dict[str, str] = {
     "moss-tts-v15":  "git clone OpenMOSS/MOSS-TTS + set OMNIVOICE_MOSS_TTS_V15_DIR  (own venv, transformers==5.0; 8B, ~16 GB weights; CUDA/ROCm/XPU/NPU/CPU, no MPS; Apache-2.0)",
     "dots-tts":      "git clone rednote-hilab/dots.tts + set OMNIVOICE_DOTS_TTS_DIR  (own venv, transformers==4.57; 2B, ~9 GB weights; CUDA/CPU, Linux/macOS only — no Windows; Apache-2.0)",
     "confucius4-tts":"git clone netease-youdao/Confucius4-TTS + set OMNIVOICE_CONFUCIUS4_TTS_DIR  (own Python 3.10 venv; 14-lang cross-lingual zero-shot clone; ~5 GB weights auto-download; CUDA/ROCm/XPU/NPU/CPU, no MPS; Apache-2.0)",
-    "audiocpp":     "download the matching audio.cpp v0.7.2 prebuilt + set OMNIVOICE_AUDIOCPP_BIN, then explicitly install Breeze-TTS-2 in the engine's Weights list in Model Catalogue  (native CPU/Vulkan/CUDA/Metal GGUF server, no Python; en+zh clone+design; ~4.73 GiB; weights research/non-commercial only)",
+    "audiocpp":     "download the matching audio.cpp v0.7.4 prebuilt + set OMNIVOICE_AUDIOCPP_BIN, then explicitly install Breeze-TTS-2 in Model Catalogue → Models  (native CPU/Vulkan/CUDA/Metal GGUF server, no Python; en+zh clone+design; ~4.73 GiB; weights research/non-commercial only)",
 }
 
 
@@ -2598,6 +2764,18 @@ def list_backends(*, include_hidden: bool = False) -> list[dict]:
             loaded_instance = _active_instance
         if loaded_instance is None:
             loaded_instance = _ENGINE_INSTANCES.get(cls)
+        if loaded_instance is None and bid == "omnivoice":
+            # Startup preloads OmniVoice through model_manager directly, before
+            # any generation route needs an adapter instance. Reflect that
+            # shared resident model here instead of contradicting
+            # /model/loaded with a stale `not_loaded` engine state.
+            try:
+                from services import model_manager
+
+                if model_manager.model is not None:
+                    loaded_instance = OmniVoiceBackend(model=model_manager.model)
+            except Exception:  # noqa: BLE001 - catalogue reads never fail on diagnostics
+                pass
         out.append({
             "id": bid,
             "display_name": cls.display_name,

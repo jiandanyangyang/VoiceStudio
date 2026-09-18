@@ -186,7 +186,8 @@ async def audiobook_import(file: UploadFile = File(...)) -> dict:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"couldn't parse PDF: {e}")
     else:
-        script = chapterize_plaintext(data.decode("utf-8", "ignore"))
+        from services.text_upload import decode_text_upload
+        script = chapterize_plaintext(decode_text_upload(data))
     if not script.strip():
         raise HTTPException(status_code=400, detail="no text found in the file")
     plan = parse_audiobook_script(script)
@@ -420,8 +421,11 @@ def _omnivoice_sampling_kwargs(opts: ExpressiveOptions) -> dict:
     today exactly: num_step 32, guidance 2.0, and NO temperature/postprocess
     kwargs (the model keeps its own defaults). Emotion is never forwarded —
     the VoiceStudio config rejects unknown kwargs."""
+    from services.performance_profiles import tts_defaults
+
+    defaults = tts_defaults()
     kw = {
-        "num_step": opts.num_step if opts.num_step is not None else LONGFORM_NUM_STEP,
+        "num_step": opts.num_step if opts.num_step is not None else defaults.get("num_step", LONGFORM_NUM_STEP),
         "guidance_scale": (
             opts.guidance_scale if opts.guidance_scale is not None else LONGFORM_GUIDANCE_SCALE
         ),
@@ -432,6 +436,8 @@ def _omnivoice_sampling_kwargs(opts: ExpressiveOptions) -> dict:
         kw["class_temperature"] = opts.class_temperature
     if opts.postprocess_output is not None:
         kw["postprocess_output"] = opts.postprocess_output
+    elif "postprocess_output" in defaults:
+        kw["postprocess_output"] = defaults["postprocess_output"]
     return kw
 
 
